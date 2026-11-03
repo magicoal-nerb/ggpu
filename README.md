@@ -20,6 +20,10 @@
 * opaque pointer types (also a difference between cpu/gpu mapped stuff, so that reduces another class of memory errors)
 * minimalist api surface without compromising much on speed and flexibility
 
+## performance
+* performance wise seems the same as a typical rendering setup, mostly through analysis on renderdoc and such
+* i'll port over the vulkan examples soon though lol
+
 ## notice
 * this is still a work in progress, so think of this as a wip. API should be consistent though :)
 * also, i'm still fairly new to Vulkan in general, so pull requests fixing the api are well appreciated!
@@ -96,6 +100,8 @@ gpuDestroy();
 ```
 
 ## images
-*mostly just screenshots of stuff i've made with ggpu*
+*mostly just screenshots of stuff i've made with ggpu*   
+
 <img width="578" height="524" alt="image" src="https://github.com/user-attachments/assets/d9a8cd28-5873-43c4-9b76-1f89de86496c" />
+
 <img width="935" height="552" alt="image" src="https://github.com/user-attachments/assets/b8cf75e2-a50b-42a3-be71-e40aa07aec1e" />
