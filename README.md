@@ -23,6 +23,7 @@
 ## notice
 * this is still a work in progress, so think of this as a wip. API should be consistent though :)
 * also, i'm still fairly new to Vulkan in general, so pull requests fixing the api are well appreciated!
+* no ai at all! so please don't do ai contributions
 
 ## code
 ```c
