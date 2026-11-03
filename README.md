@@ -29,14 +29,29 @@
 * also, i'm still fairly new to Vulkan in general, so pull requests fixing the api are well appreciated!
 * no ai at all! so please don't do ai contributions
 
-## code
+## usage
 ```c
+// put this in some compilation unit, works
+// the same as the stb headers, since the library
+// is header only
+#define GGPU_IMPLEMENTATION
+#include "ggpu/ggpu_windows.h"
+```
+
+## code example
+```c
+
+static void windowCallback(UINT msg, WPARAM kind, LPARAM arg) { ... }
+static void createSwapchain(int width, int height) { ... }
+
+// ...
+
 // Initialization :3
-gpuCreateWindow("textured triangle", 1072, 1072);
+gpuCreateWindow("textured triangle", 1072, 1072, windowCallback);
 gpuInit();
 gpuCreateSurface();
-gpuCreateSwapchain();
 gpuAllocateHeaps(512, 16);
+gpuCreateSwapchain(createSwapchain);
 
 // Construct image and IR
 GpuImage image = loadImage("hihi.png");
@@ -100,7 +115,7 @@ gpuDestroy();
 ```
 
 ## images
-*mostly just screenshots of stuff i've made with ggpu*   
+*mostly just screenshots of stuff i've made with ggpu*
 
 <img width="578" height="524" alt="image" src="https://github.com/user-attachments/assets/d9a8cd28-5873-43c4-9b76-1f89de86496c" />
 
