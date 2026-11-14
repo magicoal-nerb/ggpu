@@ -120,3 +120,5 @@ gpuDestroy();
 <img width="578" height="524" alt="image" src="https://github.com/user-attachments/assets/d9a8cd28-5873-43c4-9b76-1f89de86496c" />
 
 <img width="935" height="552" alt="image" src="https://github.com/user-attachments/assets/b8cf75e2-a50b-42a3-be71-e40aa07aec1e" />
+
+<img width="1333" height="807" alt="image" src="https://github.com/user-attachments/assets/d6ceb3fc-7f87-4eb4-a012-6aab98468de7" />
