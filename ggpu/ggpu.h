@@ -13,6 +13,7 @@
 #define GGPU_IMAGE_USER_START 16
 #define GGPU_MAX_DELETIONS 64
 #define GGPU_IMAGE_SWAPCHAIN_START 1
+#define GGPU_MAX_PENDING_WAITS 8
 
 #define GGPU_MAX_TEXTURES 16384
 #define GGPU_MAX_COLOR_TARGETS 8
@@ -214,6 +215,8 @@ typedef struct CpuPtr {
 typedef struct GpuCommandBuffer {
     VkCommandBuffer buffer;
     GpuQueueType queueType;
+    uint32_t frameIndex;   // which frame slot's pool this came from
+    uint32_t bufferIndex;  // index within that slot
 } GpuCommandBuffer;
 
 // Internal usage of an image
@@ -230,6 +233,7 @@ typedef struct GpuImageInternal {
 
 // Handle of an image with an index
 typedef struct GpuImage {
+    uint32_t address;
     uint32_t index;
     bool active;
 } GpuImage;
@@ -260,6 +264,17 @@ typedef struct GpuCommandPool {
     uint32_t commandQueue[GGPU_FRAMES_IN_FLIGHT];
     VkQueue queue;
     uint32_t queueFamilyIndex;
+
+    // Timeline semaphore signaled by every submission on this queue
+    VkSemaphore timeline;
+    uint64_t timelineValue;
+    uint64_t slotValue[GGPU_FRAMES_IN_FLIGHT];
+
+    // Waits that get attached to the next submission on this queue
+    VkSemaphore pendingWaits[GGPU_MAX_PENDING_WAITS];
+    uint64_t pendingWaitValues[GGPU_MAX_PENDING_WAITS];
+    VkPipelineStageFlags pendingWaitStages[GGPU_MAX_PENDING_WAITS];
+    uint32_t pendingWaitCount;
 } GpuCommandPool;
 
 // Internal implementation of a staging pool
@@ -323,6 +338,10 @@ typedef struct GpuContext {
     GpuCommandPool graphicsPool;
     GpuCommandPool transferPool;
     GpuCommandPool computePool;
+
+    // Unique queue families in use, for VK_SHARING_MODE_CONCURRENT resources
+    uint32_t queueFamilies[3];
+    uint32_t queueFamilyCount;
 
     GpuStagingPool stagingPool;
     GpuQueueType currentQueueType;
@@ -421,8 +440,14 @@ void gpuAllocateHeaps(uint32_t maxTextures, uint32_t maxSamplers);
 // Submits the recorded commands in `commandBuffer` and stalls the CPU until work is finished
 void gpuSubmitBlocking(GpuCommandBuffer commandBuffer);
 
-// Submits the recorded commands in `commandBuffer` without stalling the CPU. Must use a semaphore callback mechanism
-void gpuSubmit(GpuCommandBuffer commandBuffer, GpuSemaphore semaphore, uint64_t signalValue);
+// Submits the recorded commands in `commandBuffer` without stalling the CPU.
+// Returns a timeline point that is reached when the work finishes. Pass it to
+// `gpuQueueWait` to make another queue wait for it, or `gpuWaitSemaphore` to wait on the CPU.
+GpuSemaphore gpuSubmit(GpuCommandBuffer commandBuffer);
+
+// Makes the *next* submission on `queueType` (gpuSubmit, gpuSubmitBlocking or
+// gpuEndFrame) wait on the GPU until `semaphore` reaches its value, before `stage` runs.
+void gpuQueueWait(GpuQueueType queueType, GpuSemaphore semaphore, GpuStage stage);
 
 // Obtains the current swapchain image
 GpuImage gpuGetSwapchainImage();
@@ -617,7 +642,7 @@ _GGPU_PRIVATE VkPresentModeKHR _gpu_choose_present_mode() {
     VkPresentModeKHR* modes = (VkPresentModeKHR*) malloc(sizeof(VkPresentModeKHR) * count);
     vkGetPhysicalDeviceSurfacePresentModesKHR(ggpu.physicalDevice, surface, &count, modes);
 
-    VkPresentModeKHR chosen = VK_PRESENT_MODE_MAILBOX_KHR; // VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR chosen = VK_PRESENT_MODE_MAILBOX_KHR; // VK_PRESENT_MODE_MAILBOX_KHR; // VK_PRESENT_MODE_FIFO_KHR;
     for (uint32_t i = 0; i < count; i++) {
         if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
             chosen = modes[i];
@@ -758,7 +783,7 @@ _GGPU_PRIVATE bool _gpu_btest(uint32_t a, uint32_t b) {
 }
 
 // Provides us a queue create info structure for us. The index is in `queueFamilyIndex`
-_GGPU_PRIVATE VkDeviceQueueCreateInfo _gpu_find_queue_family(bool graphics, bool compute, bool transfer, uint32_t start) {
+_GGPU_PRIVATE VkDeviceQueueCreateInfo _gpu_find_queue_family(bool graphics, bool compute, bool transfer, uint32_t start, uint32_t fallback) {
     uint32_t familyCount;
     vkGetPhysicalDeviceQueueFamilyProperties(ggpu.physicalDevice, &familyCount, NULL);
 
@@ -775,6 +800,9 @@ _GGPU_PRIVATE VkDeviceQueueCreateInfo _gpu_find_queue_family(bool graphics, bool
         if (_gpu_btest(properties.queueFlags, VK_QUEUE_GRAPHICS_BIT) && graphics) break;
         if (_gpu_btest(properties.queueFlags, VK_QUEUE_COMPUTE_BIT) && compute) break;
     }
+
+    if (graphicsFamily >= familyCount)
+        graphicsFamily = fallback;
 
     free(familyProperties);
 
@@ -802,6 +830,20 @@ _GGPU_PRIVATE GpuCommandPool _gpu_create_command_pool(uint32_t queueFamilyIndex)
     poolCreateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolCreateInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolCreateInfo.queueFamilyIndex = queueFamilyIndex;
+
+    commandPool.queueFamilyIndex = queueFamilyIndex;
+
+    // Timeline semaphore that tracks completion of everything submitted on this queue
+    VkSemaphoreTypeCreateInfo timelineInfo = { 0 };
+    timelineInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    timelineInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    timelineInfo.initialValue = 0;
+
+    VkSemaphoreCreateInfo timelineCreateInfo = { 0 };
+    timelineCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    timelineCreateInfo.pNext = &timelineInfo;
+    gpuAssert(vkCreateSemaphore(ggpu.device, &timelineCreateInfo, NULL, &commandPool.timeline) == VK_SUCCESS,
+        "_gpu_create_command_pool(): failed to create timeline semaphore");
 
     // Create a set amount of stuff
     for (uint32_t i = 0; i < GGPU_FRAMES_IN_FLIGHT; i++) {
@@ -913,16 +955,32 @@ _GGPU_PRIVATE VkDevice _gpu_create_device() {
     features.features.imageCubeArray = true;
     features.pNext = &unused;
 
-    VkDeviceQueueCreateInfo graphicsInfo = _gpu_find_queue_family(true, false, false, 0);
-    VkDeviceQueueCreateInfo computeInfo = _gpu_find_queue_family(false, true, false, graphicsInfo.queueFamilyIndex + 1);
-    VkDeviceQueueCreateInfo transferInfo = _gpu_find_queue_family(false, false, true, computeInfo.queueFamilyIndex + 1);
+    VkDeviceQueueCreateInfo graphicsInfo = _gpu_find_queue_family(true, false, false, 0, 0);
+    VkDeviceQueueCreateInfo computeInfo = _gpu_find_queue_family(false, true, false,
+        graphicsInfo.queueFamilyIndex + 1, graphicsInfo.queueFamilyIndex);
+    VkDeviceQueueCreateInfo transferInfo = _gpu_find_queue_family(false, false, true,
+        (graphicsInfo.queueFamilyIndex > computeInfo.queueFamilyIndex ? graphicsInfo.queueFamilyIndex : computeInfo.queueFamilyIndex) + 1, computeInfo.queueFamilyIndex);
 
-    VkDeviceQueueCreateInfo queueCreateInfos[3] = { graphicsInfo, computeInfo, transferInfo };
+    VkDeviceQueueCreateInfo familyInfos[3] = { graphicsInfo, computeInfo, transferInfo };
+
+    // Each family may only appear once in VkDeviceCreateInfo
+    VkDeviceQueueCreateInfo queueCreateInfos[3];
+    uint32_t queueCreateInfoCount = 0;
+    ggpu.queueFamilyCount = 0;
+    for (uint32_t i = 0; i < 3; i++) {
+        bool seen = false;
+        for (uint32_t j = 0; j < queueCreateInfoCount; j++)
+            if (queueCreateInfos[j].queueFamilyIndex == familyInfos[i].queueFamilyIndex) seen = true;
+        if (seen) continue;
+
+        queueCreateInfos[queueCreateInfoCount++] = familyInfos[i];
+        ggpu.queueFamilies[ggpu.queueFamilyCount++] = familyInfos[i].queueFamilyIndex;
+    }
 
     VkDeviceCreateInfo deviceCreateInfo = { 0 };
     deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     deviceCreateInfo.pNext = &features;
-    deviceCreateInfo.queueCreateInfoCount = 3;
+    deviceCreateInfo.queueCreateInfoCount = queueCreateInfoCount;
     deviceCreateInfo.pQueueCreateInfos = queueCreateInfos;
     deviceCreateInfo.ppEnabledExtensionNames = kRequiredExtensions;
     deviceCreateInfo.enabledExtensionCount = sizeof(kRequiredExtensions) / sizeof(char*);
@@ -933,9 +991,9 @@ _GGPU_PRIVATE VkDevice _gpu_create_device() {
 
     // Populate the queues...
     ggpu.device = device;
-    ggpu.graphicsPool = _gpu_create_command_pool(queueCreateInfos[0].queueFamilyIndex);
-    ggpu.transferPool = _gpu_create_command_pool(queueCreateInfos[2].queueFamilyIndex);
-    ggpu.computePool = _gpu_create_command_pool(queueCreateInfos[1].queueFamilyIndex);
+    ggpu.graphicsPool = _gpu_create_command_pool(graphicsInfo.queueFamilyIndex);
+    ggpu.transferPool = _gpu_create_command_pool(transferInfo.queueFamilyIndex);
+    ggpu.computePool = _gpu_create_command_pool(computeInfo.queueFamilyIndex);
 
     return device;
 }
@@ -1159,7 +1217,7 @@ GpuSemaphore gpuCreateSemaphore(uint64_t value) {
     return semaphore;
 }
 
-// Waits for a semaphore's value to equal `value` with no timeout
+// Waits for a semaphore's value to >= `value` with no timeout
 void gpuWaitSemaphore(GpuSemaphore semaphore, uint64_t value) {
     VkSemaphoreWaitInfo semaphoreWaitInfo = { 0 };
     semaphoreWaitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
@@ -1253,16 +1311,90 @@ void gpuFlushDeletion() {
     ggpu.deletionSize[frame] = 0;
 }
 
+_GGPU_PRIVATE GpuCommandPool* _gpu_get_pool(GpuQueueType queueType) {
+    switch (queueType) {
+        case kGraphicsQueue: return &ggpu.graphicsPool;
+        case kComputeQueue: return &ggpu.computePool;
+        case kTransferQueue: return &ggpu.transferPool;
+    }
+    return &ggpu.graphicsPool;
+}
+
+_GGPU_PRIVATE void _gpu_reset_pool(GpuCommandPool* pool, uint32_t frame) {
+    if (pool->slotValue[frame] != 0) {
+        VkSemaphoreWaitInfo waitInfo = { 0 };
+        waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        waitInfo.semaphoreCount = 1;
+        waitInfo.pSemaphores = &pool->timeline;
+        waitInfo.pValues = &pool->slotValue[frame];
+        vkWaitSemaphores(ggpu.device, &waitInfo, UINT64_MAX);
+    }
+
+    vkResetCommandPool(ggpu.device, pool->commandPools[frame], 0);
+    pool->commandQueue[frame] = 0;
+}
+
+// REturns a timeline value instead and submits a wait/signal depending on the queue.
+// Consumes the pending waits and adds extra wait
+_GGPU_PRIVATE uint64_t _gpu_queue_submit(GpuCommandPool* pool, VkCommandBuffer* cmd, uint32_t frame,
+    VkSemaphore extraWait, VkPipelineStageFlags extraWaitStage, VkSemaphore extraSignal, VkFence fence) {
+
+    VkSemaphore waits[GGPU_MAX_PENDING_WAITS + 1];
+    uint64_t waitValues[GGPU_MAX_PENDING_WAITS + 1];
+    VkPipelineStageFlags waitStages[GGPU_MAX_PENDING_WAITS + 1];
+    uint32_t waitCount = 0;
+
+    for (uint32_t i = 0; i < pool->pendingWaitCount; i++) {
+        waits[waitCount] = pool->pendingWaits[i];
+        waitValues[waitCount] = pool->pendingWaitValues[i];
+        waitStages[waitCount] = pool->pendingWaitStages[i];
+        waitCount++;
+    }
+    pool->pendingWaitCount = 0;
+
+    if (extraWait != VK_NULL_HANDLE) {
+        waits[waitCount] = extraWait;
+        waitValues[waitCount] = 0; // ignored for binary semaphores...
+        waitStages[waitCount] = extraWaitStage;
+        waitCount++;
+    }
+
+    uint64_t value = ++pool->timelineValue;
+    VkSemaphore signals[2] = { pool->timeline, extraSignal };
+    uint64_t signalValues[2] = { value, 0 };
+    uint32_t signalCount = extraSignal != VK_NULL_HANDLE ? 2 : 1;
+
+    VkTimelineSemaphoreSubmitInfo timelineInfo = { 0 };
+    timelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timelineInfo.waitSemaphoreValueCount = waitCount;
+    timelineInfo.pWaitSemaphoreValues = waitValues;
+    timelineInfo.signalSemaphoreValueCount = signalCount;
+    timelineInfo.pSignalSemaphoreValues = signalValues;
+
+    VkSubmitInfo submitInfo = { 0 };
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.pNext = &timelineInfo;
+    submitInfo.waitSemaphoreCount = waitCount;
+    submitInfo.pWaitSemaphores = waits;
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = cmd != NULL ? 1 : 0;
+    submitInfo.pCommandBuffers = cmd;
+    submitInfo.signalSemaphoreCount = signalCount;
+    submitInfo.pSignalSemaphores = signals;
+
+    VkResult result = vkQueueSubmit(pool->queue, 1, &submitInfo, fence);
+    gpuAssert(result == VK_SUCCESS,
+        "_gpu_queue_submit(): hardware driver rejected your command queue submission! got code=%d", result);
+
+    // The pool slot can't be reset until this value is reached!
+    pool->slotValue[frame] = value;
+    return value;
+}
+
 // Grabs a command buffer for generic GPU work
 GpuCommandBuffer gpuStartCommandRecording(GpuQueueType queueType) {
     uint32_t frameIndex = ggpu.currentFrame % GGPU_FRAMES_IN_FLIGHT;
-    GpuCommandPool* targetContext = NULL;
-
-    switch (queueType) {
-        case kGraphicsQueue: targetContext = &ggpu.graphicsPool; break;
-        case kComputeQueue: targetContext = &ggpu.computePool; break;
-        case kTransferQueue: targetContext = &ggpu.transferPool; break;
-    }
+    GpuCommandPool* targetContext = _gpu_get_pool(queueType);
 
     uint32_t cmdIdx = targetContext->commandQueue[frameIndex];
     gpuAssert(cmdIdx < GGPU_CMD_BUFS_PER_POOL, "gpuStartCommandRecording(): exceeded max commands buffers!");
@@ -1276,8 +1408,11 @@ GpuCommandBuffer gpuStartCommandRecording(GpuQueueType queueType) {
     GpuCommandBuffer gpuCommandBuffer = { 0 };
     gpuCommandBuffer.buffer = commandBuffer;
     gpuCommandBuffer.queueType = queueType;
+    gpuCommandBuffer.frameIndex = frameIndex;
+    gpuCommandBuffer.bufferIndex = cmdIdx;
     ggpu.currentQueueType = queueType;
 
+    _gpu_bind_descriptor_heap(gpuCommandBuffer);
     return gpuCommandBuffer;
 }
 
@@ -1320,7 +1455,9 @@ GpuPtr gpuMallocAligned(uint32_t bytes, uint32_t alignment, GpuMemoryType memory
     bufferCreateInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferCreateInfo.size = bytes;
     bufferCreateInfo.usage = usageFlags;
-    bufferCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    bufferCreateInfo.sharingMode = ggpu.queueFamilyCount > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    bufferCreateInfo.queueFamilyIndexCount = ggpu.queueFamilyCount > 1 ? ggpu.queueFamilyCount : 0;
+    bufferCreateInfo.pQueueFamilyIndices = ggpu.queueFamilies;
 
     VkBuffer buffer;
     gpuAssert(vkCreateBuffer(ggpu.device, &bufferCreateInfo, NULL, &buffer) == VK_SUCCESS,
@@ -1351,7 +1488,6 @@ GpuPtr gpuMallocAligned(uint32_t bytes, uint32_t alignment, GpuMemoryType memory
     gpuAssert(memTypeIndex != UINT32_MAX,
         "gpuMallocAligned(): no suitable memory type found for flags 0x%x!", propertyFlags);
 
-    // BDA requires DEVICE_ADDRESS_BIT on the allocation itself
     VkMemoryAllocateFlagsInfo allocFlagsInfo = { 0 };
     allocFlagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
     allocFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
@@ -1430,60 +1566,43 @@ void gpuSubmitBlocking(GpuCommandBuffer commandBuffer) {
     gpuAssert(commandBuffer.buffer != VK_NULL_HANDLE, "gpuSubmitBlocking(): you passed in a null command buffer...");
     gpuAssert(vkEndCommandBuffer(commandBuffer.buffer) == VK_SUCCESS, "gpuSubmitBlocking(): failed to end command buffer recording");
 
-    // Alright, which queue do I use?
-    VkQueue targetQueue = VK_NULL_HANDLE;
-    switch (commandBuffer.queueType) {
-        case kGraphicsQueue: targetQueue = ggpu.graphicsPool.queue; break;
-        case kComputeQueue: targetQueue = ggpu.computePool.queue; break;
-        case kTransferQueue: targetQueue = ggpu.transferPool.queue; break;
-    }
-
-    // Try submitting stuff over...
-    VkSubmitInfo submitInfo = { 0 };
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffer.buffer;
-
+    GpuCommandPool* pool = _gpu_get_pool(commandBuffer.queueType);
     VkFence fence = ggpu.stagingPool.stagingFence;
     vkResetFences(ggpu.device, 1, &fence);
 
-    VkResult result = vkQueueSubmit(targetQueue, 1, &submitInfo, fence);
-    gpuAssert(result == VK_SUCCESS,
-        "gpuSubmitBlocking(): hardware driver rejected your command queue submission! got code=%d", result);
+    _gpu_queue_submit(pool, &commandBuffer.buffer, commandBuffer.frameIndex,
+        VK_NULL_HANDLE, 0, VK_NULL_HANDLE, fence);
 
     // Stall the CPU...
     vkWaitForFences(ggpu.device, 1, &fence, VK_TRUE, UINT64_MAX);
+
+    uint32_t* used = &pool->commandQueue[commandBuffer.frameIndex];
+    if (*used > 0 && commandBuffer.bufferIndex == *used - 1)
+        (*used)--;
 }
 
-// Submits the recorded commands in `commandBuffer` without stalling the CPU. Must use a semaphore callback mechanism
-void gpuSubmit(GpuCommandBuffer commandBuffer, GpuSemaphore semaphore, uint64_t signalValue) {
+// Submits the recorded commands in `commandBuffer` asynchronously
+GpuSemaphore gpuSubmit(GpuCommandBuffer commandBuffer) {
     gpuAssert(commandBuffer.buffer != VK_NULL_HANDLE, "gpuSubmit(): you passed in a null command buffer...");
     gpuAssert(vkEndCommandBuffer(commandBuffer.buffer) == VK_SUCCESS, "gpuSubmit(): failed to end command buffer recording");
 
-    // Alright, which queue do I use?
-    VkQueue targetQueue = VK_NULL_HANDLE;
-    switch (commandBuffer.queueType) {
-        case kGraphicsQueue: targetQueue = ggpu.graphicsPool.queue; break;
-        case kComputeQueue: targetQueue = ggpu.computePool.queue; break;
-        case kTransferQueue: targetQueue = ggpu.transferPool.queue; break;
-    }
+    GpuCommandPool* pool = _gpu_get_pool(commandBuffer.queueType);
+    uint64_t value = _gpu_queue_submit(pool, &commandBuffer.buffer, commandBuffer.frameIndex,
+        VK_NULL_HANDLE, 0, VK_NULL_HANDLE, VK_NULL_HANDLE);
 
-    VkTimelineSemaphoreSubmitInfo timeline = { 0 };
-    timeline.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    timeline.signalSemaphoreValueCount = 1;
-    timeline.pSignalSemaphoreValues = &signalValue;
+    GpuSemaphore point = { pool->timeline, value };
+    return point;
+}
 
-    // Try submitting stuff over...
-    VkSubmitInfo submitInfo = { 0 };
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffer.buffer;
-    submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = &semaphore.semaphore;
+// Makes the next submission on `queueType` wait for `semaphore` to reach its value
+void gpuQueueWait(GpuQueueType queueType, GpuSemaphore semaphore, GpuStage stage) {
+    GpuCommandPool* pool = _gpu_get_pool(queueType);
+    gpuAssert(pool->pendingWaitCount < GGPU_MAX_PENDING_WAITS, "gpuQueueWait(): too many pending waits!");
 
-    // VkFence fence = ggpu.stagingPool.stagingFence;
-    gpuAssert(vkQueueSubmit(targetQueue, 1, &submitInfo, VK_NULL_HANDLE) == VK_SUCCESS,
-        "gpuSubmit(): hardware driver rejected your command queue submission!");
+    uint32_t i = pool->pendingWaitCount++;
+    pool->pendingWaits[i] = semaphore.semaphore;
+    pool->pendingWaitValues[i] = semaphore.value;
+    pool->pendingWaitStages[i] = (VkPipelineStageFlags)_gpu_get_stage_flags(stage);
 }
 
 // Obtains the current swapchain image
@@ -1557,7 +1676,9 @@ GpuImage gpuCreateImage(GpuTextureDesc desc) {
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
     imageInfo.usage = desc.usageFlags;
-    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.sharingMode = ggpu.queueFamilyCount > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.queueFamilyIndexCount = ggpu.queueFamilyCount > 1 ? ggpu.queueFamilyCount : 0;
+    imageInfo.pQueueFamilyIndices = ggpu.queueFamilies;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkDeviceImageMemoryRequirements requirements = { 0 };
@@ -1921,7 +2042,7 @@ void gpuDrawIndirectCount(GpuPipeline* pipeline, GpuCommandBuffer commandBuffer,
 // `stride` is the size of each draw command
 void gpuDrawIndirect(GpuPipeline* pipeline, GpuCommandBuffer commandBuffer, void* data,
     GpuPtr indirectBuffer, uint32_t offset, uint32_t drawCount, uint32_t stride) {
-    gpuAssert(commandBuffer.queueType == kGraphicsQueue, "gpuDrawIndirect(): command buffer provided is not in the draw queue!");
+    // gpuAssert(commandBuffer.queueType == kGraphicsQueue, "gpuDrawIndirect(): command buffer provided is not in the draw queue!");
 
     VkCommandBuffer buffer = commandBuffer.buffer;
 
@@ -1992,7 +2113,6 @@ void gpuDispatchIndirect(GpuPipeline* pipeline, GpuCommandBuffer commandBuffer, 
     VkCommandBuffer buffer = commandBuffer.buffer;
 
     // Bind and dispatch!
-    _gpu_bind_descriptor_heap(commandBuffer);
     vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
 
     VkPushDataInfoEXT pushInfo = { 0 };
@@ -2003,9 +2123,6 @@ void gpuDispatchIndirect(GpuPipeline* pipeline, GpuCommandBuffer commandBuffer, 
     _cmd_push_data(buffer, &pushInfo);
 
     vkCmdDispatchIndirect(buffer, _gpu_get_buffer(indirectBuffer).buffer, (VkDeviceSize)offset);
-
-    // We submit the command and wait!
-    gpuSubmitBlocking(commandBuffer);
 }
 
 // Creates a sampler with the provided `desc` in `slotIndex` of the sampler heap
@@ -2214,8 +2331,6 @@ void gpuMemcpy(GpuPtr dest, GpuPtr src, uint32_t bytes) {
 // `gpuBeginFrame` must be called before this
 void gpuBeginRenderPass(GpuCommandBuffer cmd, GpuRenderPassDesc desc) {
     // Batch all barriers into one call
-    VkImageMemoryBarrier2 barriers[GGPU_MAX_COLOR_TARGETS + 1] = { 0 };
-
     // build rendering attachments
     VkRenderingAttachmentInfo colorAttachments[GGPU_MAX_COLOR_TARGETS] = { 0 };
     uint32_t colorTargetCount = 0;
@@ -2547,6 +2662,10 @@ void gpuDestroy() {
         vkDestroyCommandPool(ggpu.device, ggpu.transferPool.commandPools[i], NULL);
     }
 
+    vkDestroySemaphore(ggpu.device, ggpu.graphicsPool.timeline, NULL);
+    vkDestroySemaphore(ggpu.device, ggpu.computePool.timeline, NULL);
+    vkDestroySemaphore(ggpu.device, ggpu.transferPool.timeline, NULL);
+
     vkDestroyDevice(ggpu.device, NULL);
     vkDestroyInstance(ggpu.instance, NULL);
 
@@ -2611,20 +2730,10 @@ void gpuEndFrame(GpuCommandBuffer cmd) {
     vkCmdPipelineBarrier2(cmd.buffer, &dep);
     vkEndCommandBuffer(cmd.buffer);
 
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkSubmitInfo submit = { 0 };
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.waitSemaphoreCount = 1;
-    submit.pWaitSemaphores = &sc->inFlight[frame];
-    submit.pWaitDstStageMask = &waitStage;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd.buffer;
-    submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores = &sc->renderFinished[image];
-
-    VkResult result = vkQueueSubmit(ggpu.graphicsPool.queue, 1, &submit, sc->fences[frame]);
-    gpuAssert(result == VK_SUCCESS,
-        "gpuEndFrame(): vkQueueSubmit failed! got code = %d", result);
+    // Waits on the acquire semaphore plus anything queued with gpuQueueWait(kGraphicsQueue, ...)
+    _gpu_queue_submit(&ggpu.graphicsPool, &cmd.buffer, frame,
+        sc->inFlight[frame], VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        sc->renderFinished[image], sc->fences[frame]);
 
     VkPresentInfoKHR present = { 0 };
     present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -2672,8 +2781,10 @@ GpuCommandBuffer gpuBeginFrame(float r, float g, float b, float a) {
     vkResetFences(ggpu.device, 1, &sc->fences[frame]);
     ggpu.swapchain.currentImageIndex = imageIndex;
 
-    vkResetCommandPool(ggpu.device, ggpu.graphicsPool.commandPools[frame], 0);
-    ggpu.graphicsPool.commandQueue[frame] = 0;
+    // recycle this slot's pools once everything submitted from them has finished
+    _gpu_reset_pool(&ggpu.graphicsPool, frame);
+    _gpu_reset_pool(&ggpu.computePool, frame);
+    _gpu_reset_pool(&ggpu.transferPool, frame);
 
     GpuCommandBuffer cmd = gpuStartCommandRecording(kGraphicsQueue);
 
@@ -2695,7 +2806,6 @@ GpuCommandBuffer gpuBeginFrame(float r, float g, float b, float a) {
     dep.imageMemoryBarrierCount = 1;
     dep.pImageMemoryBarriers = &toGeneral;
     vkCmdPipelineBarrier2(cmd.buffer, &dep);
-    _gpu_bind_descriptor_heap(cmd);
 
     return cmd;
 }
